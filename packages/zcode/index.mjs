@@ -29,6 +29,7 @@ const BIGMODEL_API = "https://bigmodel.cn" // BigModel's business API, where ZCo
 const ZAI_BASE = "https://api.z.ai/api/anthropic"
 const BIGMODEL_BASE = "https://open.bigmodel.cn/api/anthropic"
 const START_BASE = ZCODE + "/api/v1/zcode-plan/anthropic"
+const BALANCE = ZCODE + "/api/v1/zcode-plan/billing/balance"
 const APP_VERSION = "3.14.3" // the ZCode whose sign-in this makes
 const UA = "ZCode/" + APP_VERSION
 
@@ -130,48 +131,131 @@ const num = (v) => {
   return typeof n === "number" && Number.isFinite(n) ? n : undefined
 }
 
-// startPlan is the Start Plan the account has now ({name, until}), as
-// ZCode reads its balance: an "active" plan past its end is over.
+// startPlan is the Start Plan the account has now ({name, until, models}), as
+// ZCode reads its balance: an "active" plan past its end is over, and so is a
+// bucket past its own. models are the ones its live buckets serve with
+// something left to spend: a model's buckets are only as dead as all of them
+// — one with quota left still serves it, the spent ones are skipped rather
+// than asked and refused.
 async function startPlan(jwt, device) {
   if (!jwt) throw new Error("not signed in to ZCode")
   if (jwtExpired(jwt)) throw new Error(EXPIRED)
-  const b = (await call("GET", `${ZCODE}/api/v1/zcode-plan/billing/balance?app_version=${APP_VERSION}`, { auth: "Bearer " + jwt, device })) ?? {}
+  const b = (await call("GET", `${BALANCE}?app_version=${APP_VERSION}`, { auth: "Bearer " + jwt, device })) ?? {}
   const now = num(b.server_time) > 0 ? num(b.server_time) : Date.now() / 1000
   const isStart = (x) => x.includes("start-plan") || x.includes("start plan")
-  for (const p of b.plans ?? []) {
-    if (String(p.status ?? "").trim().toLowerCase() !== "active") continue
-    const end = num(p.ends_at)
-    if (end > 0 && end <= now) continue
-    const id = String(p.plan_id ?? "").trim().toLowerCase()
-    const n = String(p.name ?? "").trim().toLowerCase()
+  const same = (x, p) => (x.user_plan_id && p.user_plan_id ? x.user_plan_id === p.user_plan_id : String(x.plan_id ?? "") === String(p.plan_id ?? ""))
+  const plans = Array.isArray(b.plans) ? b.plans : []
+  const live = new Set()
+  let gift = null
+  for (const p of plans) {
+    const st = String(p?.status ?? "").trim().toLowerCase()
+    const end = num(p?.ends_at)
+    if (st !== "active" || (end > 0 && end <= now)) continue
+    const id = String(p?.plan_id ?? "").trim().toLowerCase()
+    const n = String(p?.name ?? "").trim().toLowerCase()
     if ((id || n) && !isStart(id) && !isStart(n)) continue
-    return { name: first(p.name, "Start Plan"), until: end > 0 ? end * 1000 : 0 }
+    gift = { name: first(p.name, "Start Plan"), models: [] }
+    for (const x of Array.isArray(b.balances) ? b.balances : []) if (same(x, p)) live.add(x)
   }
-  return null
+  if (gift) {
+    const ms = new Set()
+    for (const x of live) {
+      const exp = num(x.expires_at)
+      if (exp > 0 && exp <= now) continue
+      // a bucket spends when it has quota: only remaining_units says so, and
+      // a model whose every bucket says none drops out of models, so its
+      // requests go to the coding plan without first asking the gift
+      if ((num(x.remaining_units) ?? 1) <= 0) continue
+      for (const c of Array.isArray(x.capabilities) ? x.capabilities : []) {
+        const m = String(c ?? "").trim().replace(/^model:/, "").trim()
+        if (m) ms.add(m)
+      }
+    }
+    gift.models = [...ms]
+  }
+  return gift
 }
 
-// onStart says whether an account's requests go to the Start Plan: when it
-// has ZCode's token and no coding plan key, or a key whose account has no
-// coding plan. Asked again after 10 minutes (a minute when unsure).
+// plansOf says where an account's requests go and what more it can spend:
+// {start, gift}. start is what onStart said: an account with no coding plan
+// sends every request to the gift; a team's seat, a sign-in with no ZCode
+// token and a key whose plan-list read found no gift stay on the coding plan.
+// gift is what a coding account also holds: the Start Plan ({name, until,
+// models}), and its requests spend the gift for a model it serves, until it
+// says it is spent (see blocked). A team or a tokenless sign-in can reach no
+// gift and a sign-in with no key reads none here: its card and its model
+// list read the balance themselves. Asked again after 10 minutes (a minute
+// when unsure).
 const routes = new Map()
-async function onStart(s) {
-  if (!s.jwt || isTeam(s)) return false // a team's seat is on the team's plan
-  if (!s.key) return true
+async function plansOf(s) {
+  if (isTeam(s) || !s.jwt) return { start: false, gift: null }
+  if (!s.key) return { start: true, gift: null }
   const id = s.key + "\0" + s.jwt
   const r = routes.get(id)
-  if (r && Date.now() - r.at < r.ttl) return r.start
+  if (r && Date.now() - r.at < r.ttl) return r
   let start = false
+  let gift = null
   let sure = false
   try {
-    start = !(await plan(s))
+    if (!(await plan(s))) start = true
+    else gift = await startPlan(s.jwt, s.device).catch(() => null)
     sure = true
   } catch {
+    // the plan list could not be read: a live gift's requests go to the gift,
+    // as they did when onStart trusted one; unsure stands for a minute
     try {
-      if (await startPlan(s.jwt, s.device)) start = sure = true
+      gift = await startPlan(s.jwt, s.device)
+      start = !!gift
+      sure = !!gift
     } catch {}
   }
-  routes.set(id, { start, at: Date.now(), ttl: sure ? 600_000 : 60_000 })
-  return start
+  const out = { start, gift, at: Date.now(), ttl: sure ? 600_000 : 60_000 }
+  routes.set(id, out)
+  return out
+}
+
+// blocked remembers the models a gift said it has none left for: a key+jwt+
+// model for a minute, so one turn that is refused does not ask again.
+const blocked = new Map()
+
+// modelOf reads the model a body asks for; "" when it is not JSON with one.
+function modelOf(text) {
+  try {
+    return String(JSON.parse(text)?.model ?? "")
+  } catch {
+    return ""
+  }
+}
+
+// giftServes: the gift's buckets name their models lowercased ("glm-5.3-
+// flash"); what is asked for arrives as the plan lists it ("GLM-5.3-Flash").
+const giftServes = (gift, m) => (gift.models ?? []).some((x) => x.toLowerCase() === m.toLowerCase())
+
+// spentUp is the gift saying it has nothing left to spend: its own no-
+// balance answers (429, code 1113 "Insufficient balance or no resource
+// package", code 1005 "exceed quota limit" — a spent gift can answer a 200
+// with one of the last two, so the body is read with the status) in either
+// the {code,msg} envelope or an error:{type,message} one. Anything else the
+// gift says stands as the answer.
+function spentUp(text, status) {
+  if (status === 429) return true
+  try {
+    const j = JSON.parse(text)
+    const code = String(j?.error?.code ?? j?.error?.type ?? j?.code ?? "")
+    const msg = String(j?.error?.message ?? j?.error?.msg ?? j?.message ?? j?.msg ?? "").toLowerCase()
+    return code === "1113" || code === "1005" || msg.includes("insufficient balance or no resource package") || msg.includes("exceed quota limit")
+  } catch {
+    return false
+  }
+}
+
+// kept sends the plan's answer on as it came, the account marked kept.
+function kept(res, text) {
+  const h = new Headers(res.headers)
+  h.delete("content-length")
+  h.delete("content-encoding")
+  h.set("X-Magpie-Sign-In", "kept")
+  return new Response(text === undefined ? res.body : text, { status: res.status, statusText: res.statusText, headers: h })
 }
 
 // ---- keys ------------------------------------------------------------------------
@@ -366,13 +450,16 @@ function startNum(v) {
   return undefined
 }
 
-// startUsage is the Start Plan's allowance: a window for each of its
-// buckets, a model's tokens for the day or for the plan's time. A plan
-// still "active" past its end is over, and its buckets are left out.
-async function startUsage(s) {
+// NO_START is what magpie said when the card asks for a gift and there
+// isn't one: kept for the gift-only card, whose alternative is nothing.
+const NO_START = "this account has no GLM Coding Plan, and ZCode's Start Plan has ended or was never started"
+
+// giftOf reads the balance and returns the Start Plan's card fields: its
+// plan and windows. null when there is no Start Plan left to show.
+async function giftOf(s) {
   if (!s.jwt) throw new Error("not signed in to ZCode")
   if (jwtExpired(s.jwt)) throw new Error(EXPIRED)
-  const b = (await call("GET", `${ZCODE}/api/v1/zcode-plan/billing/balance?app_version=${APP_VERSION}`, { auth: "Bearer " + s.jwt, device: s.device })) ?? {}
+  const b = (await call("GET", `${BALANCE}?app_version=${APP_VERSION}`, { auth: "Bearer " + s.jwt, device: s.device })) ?? {}
   const str = (v) => (typeof v === "string" ? v : "")
   const plans = (Array.isArray(b.plans) ? b.plans : []).map((p) => ({ ...p, status: str(p?.status), user_plan_id: str(p?.user_plan_id), plan_id: str(p?.plan_id) }))
   const now = startNum(b.server_time) > 0 ? startNum(b.server_time) : Math.trunc(Date.now() / 1000)
@@ -405,7 +492,7 @@ async function startUsage(s) {
     active = { name: first(str(p.name), "Start Plan"), until: end > 0 ? new Date(Math.trunc(end) * 1000).toISOString() : "" }
     break
   }
-  if (!active) return { error: "this account has no GLM Coding Plan, and ZCode's Start Plan has ended or was never started" }
+  if (!active) return null
   const out = { plan: active.name, windows: [] }
   if (active.until) Object.assign(out, { until: active.until, renew: "off" })
   for (const x of balances) {
@@ -436,6 +523,27 @@ async function startUsage(s) {
     if (span) w.span = span
     if (models.length) w.models = models
     out.windows.push(w)
+  }
+  return out
+}
+
+// startUsage is a Start Plan-only account's card: its buckets, or the words
+// for having none to show.
+async function startUsage(s) {
+  return (await giftOf(s)) ?? { error: NO_START }
+}
+
+// dualUsage is an account with both a Coding Plan and a gift: its card shows
+// both allowances, the Coding windows first and the gift's buckets after,
+// each keeping its own name, models and end. A balance read that fails leaves
+// the Coding windows up and says so.
+async function dualUsage(s) {
+  const out = await codingUsage(s)
+  try {
+    const g = await giftOf(s)
+    if (g) out.windows = [...out.windows, ...g.windows]
+  } catch (e) {
+    out.error = `the GLM Coding Plan's allowance shows; its Start Plan could not be read: ${e?.message ?? e}`
   }
   return out
 }
@@ -1168,7 +1276,9 @@ export async function ZCodeAuthPlugin({ client }) {
       async models(provider, { auth } = {}) {
         const s = stateOf(auth)
         if (!s) return provider.models
-        const start = await onStart(s).catch(() => false)
+        // the models an account may use: its Coding Plan's list (a superset —
+        // the gift serves all but GLM-5.3), or the gift's when it has no Coding.
+        const start = await plansOf(s).then((r) => r.start).catch(() => false)
         const base = start ? START_BASE : s.base
         let ms = modelsOf(await zcodeConfig().catch(() => null), planID(base))
         // ZCode's config can't be had: its table stands in, and magpie keeps
@@ -1196,12 +1306,16 @@ export async function ZCodeAuthPlugin({ client }) {
             if (!s) throw new Error("not signed in to ZCode")
             let url = input instanceof Request ? input.url : String(input)
             const opts = input instanceof Request ? { method: input.method, headers: input.headers, body: input.body, signal: input.signal, duplex: "half", ...init } : { ...init }
-            const start = await onStart(s)
-            // the request goes to the plan the account is on, wherever it was made for
-            for (const b of [START_BASE, ZAI_BASE, BIGMODEL_BASE]) {
-              if (url.startsWith(b)) {
-                url = (start ? START_BASE : s.base) + url.slice(b.length)
-                break
+            // where a request goes: an account with no coding plan sends all of
+            // them to the gift; one with both spends the gift first, for a
+            // model it serves, until the gift says it has none left for it
+            const { start: alone, gift } = await plansOf(s)
+            const swap = (base) => {
+              for (const b of [START_BASE, ZAI_BASE, BIGMODEL_BASE]) {
+                if (url.startsWith(b)) {
+                  url = base + url.slice(b.length)
+                  break
+                }
               }
             }
             let key = s.key
@@ -1212,32 +1326,61 @@ export async function ZCodeAuthPlugin({ client }) {
                 await client?.auth?.set?.({ path: { id }, body: next }).catch?.(() => {})
               }
             }
-            const h = new Headers(opts.headers)
+            // a dual account's body is read ahead of sending, so a gift that
+            // says it is spent can spend nothing and replay what was asked for
+            let start = alone
+            let orig
+            if (!alone && gift && opts.body != null) {
+              orig = opts.body = typeof opts.body === "string" ? opts.body : await new Response(opts.body).text()
+              delete opts.duplex
+              const m = modelOf(orig)
+              start = !!m && giftServes(gift, m) && Date.now() >= (blocked.get(s.key + "\0" + s.jwt + "\0" + m) ?? 0)
+            }
+            let h = new Headers(opts.headers)
             if (start) {
               if (jwtExpired(s.jwt)) throw new Error(EXPIRED)
               if (!s.jwt) throw new Error("ZCode's sign-in has no key; sign in again")
+              swap(START_BASE)
               // the Start Plan is served only to what looks like ZCode's own request
               startHeaders(h, s.jwt)
               if (opts.body != null) {
-                const text = typeof opts.body === "string" ? opts.body : await new Response(opts.body).text()
+                const text = orig ?? (typeof opts.body === "string" ? opts.body : await new Response(opts.body).text())
                 opts.body = dress(text, s.site, s.device)
                 delete opts.duplex
                 h.delete("content-length")
               }
             } else {
               if (!key) throw new Error("ZCode's sign-in has no key; sign in again")
+              swap(s.base)
               h.delete("authorization")
               h.set("x-api-key", key)
               h.set("Authorization", "Bearer " + key)
             }
-            const res = await fetch(url, { ...opts, headers: h })
+            let res = await fetch(url, { ...opts, headers: h })
+            // the gift is spent? a dual account's request goes to its coding
+            // plan instead, as the agent sent it, once per model, and that
+            // model keeps to the coding plan for a minute. A spent gift says
+            // so with a 4xx or with a JSON error in a 200 body (code 1005);
+            // anything else the gift says stands: its 405, its "unusual
+            // activity", all of it. A stream's body is never read here.
+            if (start && !alone) {
+              const json = (res.headers.get("content-type") ?? "").includes("application/json")
+              if (res.status >= 400 || json) {
+                const text = await res.text()
+                if (!spentUp(text, res.status)) return kept(res, text)
+                for (const [k, until] of blocked) if (Date.now() >= until) blocked.delete(k)
+                blocked.set(s.key + "\0" + s.jwt + "\0" + modelOf(orig), Date.now() + 60_000)
+                swap(s.base)
+                h = new Headers(opts.headers)
+                h.delete("authorization")
+                h.set("x-api-key", key)
+                h.set("Authorization", "Bearer " + key)
+                res = await fetch(url, { ...opts, body: orig, headers: h })
+              }
+            }
             // the plan's answer goes on as it came, the account kept: the
             // built-in never marked a ZCode account lapsed nor cleared one
-            const kept = new Headers(res.headers)
-            kept.delete("content-length")
-            kept.delete("content-encoding")
-            kept.set("X-Magpie-Sign-In", "kept")
-            return new Response(res.body, { status: res.status, statusText: res.statusText, headers: kept })
+            return kept(res)
           },
         }
       },
@@ -1269,7 +1412,9 @@ export async function ZCodeAuthPlugin({ client }) {
             }
             return saved(await teamUsage(s, key))
           }
-          if (await onStart(s)) return saved(await startUsage(s))
+          const { start, gift } = await plansOf(s)
+          if (start) return saved(await startUsage(s))
+          if (gift) return saved(await dualUsage(s))
           return saved(await codingUsage(s))
         } catch (e) {
           return saved({ error: e?.message ?? String(e) })
@@ -1300,4 +1445,4 @@ export async function ZCodeAuthPlugin({ client }) {
 }
 
 // for tests
-export const _internal = { entry, limitWindows, termOf, startUsage, routes, teamKeys, ownSignIn, stateOf, dress, PROMPT }
+export const _internal = { entry, limitWindows, termOf, startUsage, routes, blocked, teamKeys, ownSignIn, stateOf, dress, PROMPT }
