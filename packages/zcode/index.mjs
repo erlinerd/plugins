@@ -131,8 +131,8 @@ const num = (v) => {
   return typeof n === "number" && Number.isFinite(n) ? n : undefined
 }
 
-// startPlan is the Start Plan the account has now ({name, until, models}), as
-// ZCode reads its balance: an "active" plan past its end is over, and so is a
+// startPlan is the Start Plan the account has now ({models}), as ZCode reads
+// its balance: an "active" plan past its end is over, and so is a
 // bucket past its own. models are the ones its live buckets serve with
 // something left to spend: a model's buckets are only as dead as all of them
 // — one with quota left still serves it, the spent ones are skipped rather
@@ -154,7 +154,7 @@ async function startPlan(jwt, device) {
     const id = String(p?.plan_id ?? "").trim().toLowerCase()
     const n = String(p?.name ?? "").trim().toLowerCase()
     if ((id || n) && !isStart(id) && !isStart(n)) continue
-    gift = { name: first(p.name, "Start Plan"), models: [] }
+    gift = { models: [] }
     for (const x of Array.isArray(b.balances) ? b.balances : []) if (same(x, p)) live.add(x)
   }
   if (gift) {
@@ -178,14 +178,15 @@ async function startPlan(jwt, device) {
 
 // plansOf says where an account's requests go and what more it can spend:
 // {start, gift}. start is what onStart said: an account with no coding plan
-// sends every request to the gift; a team's seat, a sign-in with no ZCode
-// token and a key whose plan-list read found no gift stay on the coding plan.
-// gift is what a coding account also holds: the Start Plan ({name, until,
-// models}), and its requests spend the gift for a model it serves, until it
-// says it is spent (see blocked). A team or a tokenless sign-in can reach no
-// gift and a sign-in with no key reads none here: its card and its model
-// list read the balance themselves. Asked again after 10 minutes (a minute
-// when unsure).
+// sends every request to the gift and reads no balance to do it; a team's
+// seat, a sign-in with no ZCode token and a key whose plan-list read found
+// no gift stay on the coding plan. gift is what a coding account also holds:
+// the Start Plan ({models}), and its requests spend the gift for a model it
+// serves, until it says it is spent (see blocked). A team or a tokenless
+// sign-in can reach no gift and a sign-in with no key reads none here: its
+// card and its model list read the balance themselves. Asked again after 10
+// minutes (a minute when unsure, or when a gift read failed — one that fails
+// at once is retried a minute later, not after the 10 the plan list earned).
 const routes = new Map()
 async function plansOf(s) {
   if (isTeam(s) || !s.jwt) return { start: false, gift: null }
@@ -199,7 +200,7 @@ async function plansOf(s) {
   try {
     if (!(await plan(s))) start = true
     else gift = await startPlan(s.jwt, s.device).catch(() => null)
-    sure = true
+    sure = start || !!gift
   } catch {
     // the plan list could not be read: a live gift's requests go to the gift,
     // as they did when onStart trusted one; unsure stands for a minute
@@ -535,16 +536,16 @@ async function startUsage(s) {
 
 // dualUsage is an account with both a Coding Plan and a gift: its card shows
 // both allowances, the Coding windows first and the gift's buckets after,
-// each keeping its own name, models and end. A balance read that fails leaves
-// the Coding windows up and says so.
+// each keeping its own models and end. A balance read that fails leaves just
+// the Coding card: magpie hides a card's windows behind an error and leaves
+// it out of the menu bar and auto-switch, so erroring here would hide a
+// working Coding Plan over a gift hiccup.
 async function dualUsage(s) {
   const out = await codingUsage(s)
   try {
     const g = await giftOf(s)
     if (g) out.windows = [...out.windows, ...g.windows]
-  } catch (e) {
-    out.error = `the GLM Coding Plan's allowance shows; its Start Plan could not be read: ${e?.message ?? e}`
-  }
+  } catch {}
   return out
 }
 
@@ -1334,7 +1335,9 @@ export async function ZCodeAuthPlugin({ client }) {
               orig = opts.body = typeof opts.body === "string" ? opts.body : await new Response(opts.body).text()
               delete opts.duplex
               const m = modelOf(orig)
-              start = !!m && giftServes(gift, m) && Date.now() >= (blocked.get(s.key + "\0" + s.jwt + "\0" + m) ?? 0)
+              // a ZCode sign-in past its end reaches no gift: the coding plan
+              // takes the request, as it did before the gift was known
+              start = !!m && !jwtExpired(s.jwt) && giftServes(gift, m) && Date.now() >= (blocked.get(s.key + "\0" + s.jwt + "\0" + m) ?? 0)
             }
             let h = new Headers(opts.headers)
             if (start) {
@@ -1357,19 +1360,27 @@ export async function ZCodeAuthPlugin({ client }) {
               h.set("Authorization", "Bearer " + key)
             }
             let res = await fetch(url, { ...opts, headers: h })
-            // the gift is spent? a dual account's request goes to its coding
-            // plan instead, as the agent sent it, once per model, and that
-            // model keeps to the coding plan for a minute. A spent gift says
-            // so with a 4xx or with a JSON error in a 200 body (code 1005);
-            // anything else the gift says stands: its 405, its "unusual
-            // activity", all of it. A stream's body is never read here.
+            // a dual account's gift answer that can't serve the request goes
+            // to its coding plan instead, as the agent sent it: any status
+            // over 400 (its 405, its 401, its 5xx — a paid plan is waiting,
+            // and a gift that keeps refusing would otherwise black out the
+            // account), and its quota answers inside a 200. Only a quota
+            // answer keeps the model off the gift for a minute: a refusal
+            // that says nothing about quota is asked again next request.
+            // Every 429 counts as spent, Z.ai's 1302/1303 rate limits among
+            // them — replaying one to the coding plan is the good answer, and
+            // the minute's block keeps a rate limit from being knocked twice.
+            // A stream's body is never read here.
             if (start && !alone) {
               const json = (res.headers.get("content-type") ?? "").includes("application/json")
               if (res.status >= 400 || json) {
                 const text = await res.text()
-                if (!spentUp(text, res.status)) return kept(res, text)
-                for (const [k, until] of blocked) if (Date.now() >= until) blocked.delete(k)
-                blocked.set(s.key + "\0" + s.jwt + "\0" + modelOf(orig), Date.now() + 60_000)
+                const spent = spentUp(text, res.status)
+                if (!spent && res.status < 400) return kept(res, text)
+                if (spent) {
+                  for (const [k, until] of blocked) if (Date.now() >= until) blocked.delete(k)
+                  blocked.set(s.key + "\0" + s.jwt + "\0" + modelOf(orig), Date.now() + 60_000)
+                }
                 swap(s.base)
                 h = new Headers(opts.headers)
                 h.delete("authorization")

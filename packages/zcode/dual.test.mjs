@@ -80,15 +80,18 @@ test("the card shows the Coding windows and the gift's buckets together", async 
   expect(u.windows[1].resetsAt).toBe(new Date((now + 3600) * 1000).toISOString())
 })
 
-test("a gift read that fails after the gift was known leaves the Coding windows up and says so", async () => {
+test("a gift read that fails after the gift was known leaves just the Coding card", async () => {
   answers["/api/biz/subscription/list"] = ok([{ productName: "GLM Coding Pro", status: "VALID" }])
   answers["/api/monitor/usage/quota/limit"] = ok({ limits: [{ type: "CREDIT_LIMIT", unit: 3, number: 5, usage: 2000, remaining: 1500, percentage: 25 }] })
   answers["/api/v1/zcode-plan/billing/balance"] = ok(balance)
   await (await hooks()).usage(async () => coding, { id: "zcode" }) // reads and caches the gift
   answers["/api/v1/zcode-plan/billing/balance"] = new Response("", { status: 500 })
   const u = await (await hooks()).usage(async () => coding, { id: "zcode" })
+  // no error on the card: magpie hides a card's windows behind an error and
+  // leaves it out of the menu bar and auto-switch, so a gift hiccup must
+  // not black out a working Coding Plan
   expect(u.windows.map((w) => w.name)).toEqual(["5 hours"])
-  expect(u.error).toContain("Start Plan could not be read")
+  expect(u.error).toBeUndefined()
 })
 
 test("a coding account whose gift read fails at once is just a coding card", async () => {
@@ -221,13 +224,48 @@ test("a gift's 200 success answers normally: no second read, no replay", async (
   expect(await res.text()).toBe("data: {}\n\n") // the stream body passes through unread
 })
 
-test("any other Start refusal stands: no replay to the coding plan", async () => {
+// the maintainer's review (#13): a paid plan is waiting, so a gift that
+// refuses for any reason over 400 — its 405 "unusual activity", a 502 —
+// sends the request to the coding plan rather than blacking the account
+// out; only a quota answer keeps the model off the gift, so a 405 is asked
+// again next request rather than pinned away for a minute.
+test("a gift refusal replays to the coding plan but keeps the gift unblocked", async () => {
   planAndBalance()
   answers["/api/v1/zcode-plan/anthropic/v1/messages"] = new Response(JSON.stringify({ code: "3012", msg: "unusual activity" }), { status: 405 })
+  answers["/api/anthropic/v1/messages"] = ok({ type: "message", content: [] })
   const res = await sendTo(MSG, body("glm-5.3-flash"))
-  expect(res.status).toBe(405)
-  // the plan list, the balance and one message call: never a coding request
-  expect(sent.filter((c) => c.path === "/api/anthropic/v1/messages").length).toBe(0)
+  expect(res.status).toBe(200)
+  expect(sent.at(-1).origin).toBe("https://api.z.ai")
+  expect(_internal.blocked.size).toBe(0) // nothing about quota: the gift is asked again
+  const before = sent.length
+  await sendTo(MSG, body("glm-5.3-flash"))
+  expect(sent.slice(before).some((c) => c.origin === "https://zcode.z.ai")).toBe(true)
+})
+
+test("a ZCode sign-in that expired after the gift was cached goes to the coding plan", async () => {
+  // the review's shape: plansOf cached a gift while the JWT was live; it
+  // expires inside the 10-minute window. The gift can't be dressed for then
+  // — the key still works, so the coding plan takes the request rather
+  // than a "sign-in has expired" throw (0.1.7 never threw for these).
+  planAndBalance()
+  answers["/api/anthropic/v1/messages"] = ok({ type: "message", content: [] })
+  const dead = ["{}", JSON.stringify({ exp: Math.floor(Date.now() / 1000) - 10 })].map((s) => Buffer.from(s).toString("base64url")).join(".") + ".sig"
+  _internal.routes.set(KEY + "\0" + dead, { start: false, gift: { models: ["glm-5.3-flash"] }, at: Date.now(), ttl: 600_000 })
+  const aged = { ...coding, refresh: JSON.stringify({ ...JSON.parse(coding.refresh), jwt: dead }) }
+  const opts = await (await hooks()).loader(async () => aged, { id: "zcode" })
+  const res = await opts.fetch(MSG, { method: "POST", headers: { "content-type": "application/json", "x-api-key": "zcode" }, body: body("glm-5.3-flash") })
+  expect(res.status).toBe(200) // no throw: the key still works
+  expect(sent.at(-1).origin).toBe("https://api.z.ai")
+  expect(sent.at(-1).headers["x-api-key"]).toBe(KEY)
+})
+
+test("a gift read that fails at once is asked again in a minute, not ten", async () => {
+  answers["/api/biz/subscription/list"] = ok([{ productName: "GLM Coding Pro", status: "VALID" }])
+  answers["/api/v1/zcode-plan/billing/balance"] = new Response("", { status: 500 })
+  await sendTo(MSG, body("glm-5.3-flash")) // reads the plan (coding) and fails the gift
+  const r = _internal.routes.get(KEY + "\0" + jwt)
+  expect(r.start).toBe(false) // on the coding plan
+  expect(r.ttl).toBe(60_000) // unsure: a failed gift read does not earn the plan list's 10 minutes
 })
 
 test("a gift-only account sends every request to the Start Plan, and reads no balance to do it", async () => {
