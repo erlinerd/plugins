@@ -54,11 +54,41 @@ Before each request, the plugin checks which plan the account is on, and
 asks again every 10 minutes:
 
 - If the key's account has a GLM Coding Plan
-  (`/api/biz/subscription/list`), requests go to that plan.
-- Otherwise they go to the Start Plan.
+  (`/api/biz/subscription/list`), its requests go to that plan —
+  except for a model the account's gift plans also serve, which goes to
+  the gift first (see below).
+- Otherwise they go to the gift plans.
 
 Every request carries the key as both `x-api-key` and
 `Authorization: Bearer`.
+
+**Spending the gift first.** An account with a GLM Coding Plan can also
+hold gift plans from ZCode activities, ones that expire on a fixed date.
+Their allowance would lapse unused if every request went to the coding
+plan, so the plugin reads the gift's balance (per the sign-in's session,
+kept for 10 minutes) and sends a request for a model the gift still has
+quota to spend to the gift first, dressed as ZCode's own. A bucket is
+judged spent only by its `remaining_units` — a missing one is unknown,
+not spent — and a model whose every bucket says none goes straight to
+the coding plan without asking. When the gift can't serve the request —
+any answer 400 or over (its 405, its 401, its 5xx), or its quota error
+(code 1113 "Insufficient balance or no resource package", code 1005
+"exceed quota limit", which it can answer inside an HTTP 200) — the
+plugin replays the request once to the coding plan, as the agent sent
+it. Only a quota answer keeps that model off the gift for a minute; a
+refusal that says nothing about quota is asked again next request. Every
+429 counts as spent, Z.ai's 1302/1303 rate limits among them. A stream's
+body is never read or buffered on the way.
+
+## The usage card
+
+An account with both plans shows both allowances: the coding plan's
+windows first, then the gift's buckets, each with its own name, models
+and end. The card's plan and term stay the coding plan's. A gift read
+that fails leaves just the coding card — magpie hides a card's windows
+behind an error, so a gift hiccup must not black out a working Coding
+Plan. A gift that goes out of date while requests use it simply stops
+showing.
 
 ## Models
 
